@@ -1,6 +1,6 @@
 import express from "express";
 import {
-  createGuestOrder,
+  createOrder,
   mpesaCallback,
   getOrders,
   getOrderById,
@@ -19,40 +19,68 @@ const router = express.Router();
 
 /**
  * @swagger
- * /api/orders/guest:
+ * /api/orders:
  *   post:
- *     summary: Create a guest order (MPESA payment)
+ *     summary: Create a new order (Authenticated user, MPESA payment)
  *     tags: [Orders]
+ *     security:
+ *       - bearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
  *           schema:
- *             $ref: '#/components/schemas/Order'
+ *             type: object
+ *             required:
+ *               - items
+ *             properties:
+ *               items:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   required:
+ *                     - book
+ *                     - qty
+ *                   properties:
+ *                     book:
+ *                       type: string
+ *                       description: Book ID
+ *                     qty:
+ *                       type: integer
+ *                       description: Quantity
+ *               shippingFee:
+ *                 type: number
+ *                 description: Optional shipping fee
+ *                 default: 0
  *     responses:
  *       201:
- *         description: Order created and payment initiated
+ *         description: Order created and MPESA payment initiated
  *         content:
  *           application/json:
  *             schema:
  *               type: object
  *               properties:
- *                 message:
- *                   type: string
- *                 checkoutRequestID:
- *                   type: string
- *                 order:
- *                   $ref: '#/components/schemas/Order'
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     orderId:
+ *                       type: string
+ *                     mpesa:
+ *                       type: object
  *       400:
  *         description: Invalid input
+ *       401:
+ *         description: Unauthorized
  */
-router.post("/guest", createGuestOrder);
+router.post("/", protect, createOrder);
 
 /**
  * @swagger
  * /api/orders/mpesa/callback:
  *   post:
- *     summary: MPESA payment callback (Internal use)
+ *     summary: MPESA payment callback (Safaricom server → backend)
  *     tags: [Orders]
  *     requestBody:
  *       required: true
@@ -63,14 +91,11 @@ router.post("/guest", createGuestOrder);
  *             properties:
  *               Body:
  *                 type: object
- *                 properties:
- *                   stkCallback:
- *                     type: object
  *     responses:
  *       200:
- *         description: Callback processed
+ *         description: Callback processed successfully
  *       400:
- *         description: Invalid callback
+ *         description: Invalid callback payload
  */
 router.post("/mpesa/callback", mpesaCallback);
 
@@ -82,15 +107,41 @@ router.post("/mpesa/callback", mpesaCallback);
  *     tags: [Orders]
  *     security:
  *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [PENDING, PAID, FAILED]
+ *         description: Filter orders by payment status
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *         description: Page number
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *         description: Number of items per page
  *     responses:
  *       200:
  *         description: List of orders
  *         content:
  *           application/json:
  *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Order'
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 count:
+ *                   type: integer
+ *                 pagination:
+ *                   type: object
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/Order'
  *       401:
  *         description: Unauthorized
  *       403:
@@ -102,7 +153,7 @@ router.get("/", protect, admin, getOrders);
  * @swagger
  * /api/orders/{id}:
  *   get:
- *     summary: Get order by ID (Admin only)
+ *     summary: Get order by ID (Admin or order owner)
  *     tags: [Orders]
  *     security:
  *       - bearerAuth: []
@@ -119,15 +170,20 @@ router.get("/", protect, admin, getOrders);
  *         content:
  *           application/json:
  *             schema:
- *               $ref: '#/components/schemas/Order'
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   $ref: '#/components/schemas/Order'
  *       401:
  *         description: Unauthorized
  *       403:
- *         description: Forbidden (admin only)
+ *         description: Forbidden
  *       404:
  *         description: Order not found
  */
-router.get("/:id", protect, admin, getOrderById);
+router.get("/:id", protect, getOrderById);
 
 /**
  * @swagger
@@ -150,21 +206,28 @@ router.get("/:id", protect, admin, getOrderById);
  *         application/json:
  *           schema:
  *             type: object
+ *             required:
+ *               - status
  *             properties:
  *               status:
  *                 type: string
- *                 enum: [processing, shipped, delivered, cancelled]
+ *                 enum: [PROCESSING, SHIPPED, DELIVERED, CANCELLED]
  *     responses:
  *       200:
  *         description: Order status updated
  *         content:
  *           application/json:
  *             schema:
- *               $ref: '#/components/schemas/Order'
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   $ref: '#/components/schemas/Order'
  *       401:
  *         description: Unauthorized
  *       403:
- *         description: Forbidden (admin only)
+ *         description: Forbidden
  *       404:
  *         description: Order not found
  */

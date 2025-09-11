@@ -1,3 +1,4 @@
+// models/Order.js
 import mongoose from "mongoose";
 
 const orderItemSchema = new mongoose.Schema({
@@ -25,12 +26,10 @@ const orderItemSchema = new mongoose.Schema({
 const customerSchema = new mongoose.Schema({
   name: {
     type: String,
-    required: true,
     trim: true
   },
   phone: {
     type: String,
-    required: true,
     match: [/^254[17]\d{8}$/, "Please use valid MPESA phone format (254XXXXXXXXX)"]
   },
   email: {
@@ -54,7 +53,14 @@ const mpesaSchema = new mongoose.Schema({
 
 const orderSchema = new mongoose.Schema(
   {
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      index: true,
+      required: true // orders must be tied to an authenticated user
+    },
     items: [orderItemSchema],
+    // keep customer snapshot (useful for shipping / historical record)
     customer: customerSchema,
     subtotal: {
       type: Number,
@@ -100,7 +106,7 @@ const orderSchema = new mongoose.Schema(
   }
 );
 
-// Indexes for faster queries
+// Indexes for fast lookups
 orderSchema.index({ "customer.phone": 1 });
 orderSchema.index({ "mpesa.checkoutRequestId": 1 });
 orderSchema.index({ paymentStatus: 1, status: 1 });

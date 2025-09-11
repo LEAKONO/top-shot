@@ -7,7 +7,8 @@ import { swaggerSetup } from './config/swagger.js';
 
 // ... after all other middleware but before routes
 import cookieParser from "cookie-parser";
-import connectDB from "./config/db.js";import routes from "./routes/index.js";
+import connectDB from "./config/db.js";
+import routes from "./routes/index.js";
 import { errorHandler } from "./middleware/error.js";
 
 // Load environment variables

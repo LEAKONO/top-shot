@@ -3,6 +3,7 @@ import bookRoutes from "./books.js";
 import orderRoutes from "./orders.js";
 import adminRoutes from "./admin.js";
 import authRoutes from "./auth.js";
+import cartRoutes from "./cart.js";
 
 const router = express.Router();
 
@@ -60,5 +61,7 @@ router.use("/books", bookRoutes);
 router.use("/orders", orderRoutes);
 router.use("/admin", adminRoutes);
 router.use("/auth", authRoutes);
+router.use("/cart", cartRoutes);
+
 
 export default router;
