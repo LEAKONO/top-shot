@@ -1,10 +1,5 @@
 import swaggerJsdoc from 'swagger-jsdoc';
 import swaggerUi from 'swagger-ui-express';
-import { fileURLToPath } from 'url';
-import path from 'path';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const options = {
   definition: {
@@ -13,14 +8,10 @@ const options = {
       title: 'Bookstore API',
       version: '1.0.0',
       description: 'API documentation for the Bookstore backend',
-      contact: {
-        name: 'Your Name',
-        email: 'your@email.com'
-      }
     },
     servers: [
       {
-        url: 'http://localhost:5000/api',
+        url: 'http://localhost:5000',
         description: 'Development server'
       },
     ],
@@ -37,10 +28,8 @@ const options = {
       bearerAuth: []
     }]
   },
-  apis: [
-    path.join(__dirname, '../routes/*.js'),
-    // path.join(__dirname, '../models/*.js')
-  ]
+  // SIMPLIFIED API PATHS - Remove the complex path resolution
+  apis: ['./src/routes/*.js'] // Simple relative path
 };
 
 const specs = swaggerJsdoc(options);

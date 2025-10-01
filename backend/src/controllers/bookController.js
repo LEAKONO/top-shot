@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { NotFoundError, ValidationError } from "../errors/index.js";
 import { asyncHandler } from "../middleware/async.js";
 import { buildFilterQuery, buildSortQuery } from "../utils/queryBuilder.js";
+import { uploadBookImages, cloudinary } from "../middleware/upload.js";
 
 /**
  * @desc    Get all books with filtering, sorting and pagination
@@ -70,62 +71,106 @@ export const getBookById = asyncHandler(async (req, res) => {
 });
 
 /**
- * @desc    Create new book
+ * @desc    Create new book with image upload
  * @route   POST /api/books
  * @access  Private/Admin
  */
-export const createBook = asyncHandler(async (req, res) => {
-  const { title, price, stock } = req.body;
-  
-  if (!title || price === undefined) {
-    throw new ValidationError("Title and price are required");
-  }
+export const createBook = [
+  uploadBookImages,
+  asyncHandler(async (req, res) => {
+    const { title, price, stock, description, author, genre, isbn } = req.body;
+    
+    if (!title || price === undefined) {
+      throw new ValidationError("Title and price are required");
+    }
 
-  const book = await Book.create({
-    ...req.body,
-    createdBy: req.user._id
-  });
+    // Handle image upload
+    const imageData = {};
+    if (req.files?.mainImage) {
+      const mainImage = req.files.mainImage[0];
+      imageData.image = {
+        url: mainImage.path,
+        publicId: mainImage.filename
+      };
+    }
 
-  res.status(201).json({
-    success: true,
-    data: book
-  });
-});
+    if (req.files?.additionalImages) {
+      imageData.images = req.files.additionalImages.map(img => ({
+        url: img.path,
+        publicId: img.filename,
+        caption: ""
+      }));
+    }
+
+    const book = await Book.create({
+      title,
+      price: parseFloat(price),
+      stock: parseInt(stock),
+      description,
+      author,
+      genre,
+      isbn,
+      ...imageData,
+      createdBy: req.user._id
+    });
+
+    res.status(201).json({
+      success: true,
+      data: book
+    });
+  })
+];
 
 /**
- * @desc    Update book
+ * @desc    Update book with image handling
  * @route   PUT /api/books/:id
  * @access  Private/Admin
  */
-export const updateBook = asyncHandler(async (req, res) => {
-  if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-    throw new ValidationError("Invalid book ID format");
-  }
-
-  const book = await Book.findByIdAndUpdate(
-    req.params.id,
-    {
-      ...req.body,
-      lastUpdatedBy: req.user._id
-    },
-    { 
-      new: true,
-      runValidators: true 
+export const updateBook = [
+  uploadBookImages,
+  asyncHandler(async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      throw new ValidationError("Invalid book ID format");
     }
-  );
 
-  if (!book) {
-    throw new NotFoundError("Book not found");
-  }
+    const book = await Book.findById(req.params.id);
+    if (!book) {
+      throw new NotFoundError("Book not found");
+    }
 
-  res.json({
-    success: true,
-    data: book
-  });
-});
+    // Handle image updates
+    if (req.files?.mainImage) {
+      // Delete old image from Cloudinary
+      if (book.image?.publicId) {
+        await cloudinary.uploader.destroy(book.image.publicId);
+      }
+
+      const mainImage = req.files.mainImage[0];
+      book.image = {
+        url: mainImage.path,
+        publicId: mainImage.filename
+      };
+    }
+
+    // Update other fields
+    Object.keys(req.body).forEach(key => {
+      if (key !== "image" && req.body[key] !== undefined) {
+        book[key] = req.body[key];
+      }
+    });
+
+    book.lastUpdatedBy = req.user._id;
+    await book.save();
+
+    res.json({
+      success: true,
+      data: book
+    });
+  })
+];
 
 /**
- * @desc    Delete book
+ * @desc    Delete book and its images
  * @route   DELETE /api/books/:id
  * @access  Private/Admin
  */
@@ -134,14 +179,49 @@ export const deleteBook = asyncHandler(async (req, res) => {
     throw new ValidationError("Invalid book ID format");
   }
 
-  const book = await Book.findByIdAndDelete(req.params.id);
+  const book = await Book.findById(req.params.id);
   
   if (!book) {
     throw new NotFoundError("Book not found");
   }
 
+  // Delete images from Cloudinary
+  if (book.image?.publicId) {
+    await cloudinary.uploader.destroy(book.image.publicId);
+  }
+
+  if (book.images?.length > 0) {
+    const publicIds = book.images.map(img => img.publicId);
+    await Promise.all(
+      publicIds.map(publicId => 
+        cloudinary.uploader.destroy(publicId)
+      )
+    );
+  }
+
+  await Book.findByIdAndDelete(req.params.id);
+
   res.json({
     success: true,
     data: { id: req.params.id }
+  });
+});
+
+/**
+ * @desc    Get personalized recommendations for user
+ * @route   GET /api/books/recommendations/personalized
+ * @access  Private
+ */
+export const getPersonalizedRecommendations = asyncHandler(async (req, res) => {
+  // Simple recommendations based on genre popularity
+  const popularBooks = await Book.find({ active: true })
+    .sort("-rating -createdAt")
+    .limit(12)
+    .select("title author price image rating")
+    .lean();
+  
+  res.json({
+    success: true,
+    data: popularBooks
   });
 });

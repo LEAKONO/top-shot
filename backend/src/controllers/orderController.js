@@ -1,4 +1,3 @@
-// controllers/orderController.js
 import Order from "../models/Order.js";
 import Book from "../models/Book.js";
 import { stkPush } from "../services/mpesaService.js";
@@ -8,23 +7,18 @@ import {
   PaymentError
 } from "../errors/index.js";
 import { asyncHandler } from "../middleware/async.js";
+import { sendOrderConfirmation } from "../services/emailService.js";
 
 /**
- * @desc    Create new order with MPESA payment (Authenticated user only)
+ * @desc    Create new order with MPESA payment and email notification
  * @route   POST /api/orders
  * @access  Private
  */
 export const createOrder = asyncHandler(async (req, res) => {
-  const { items, shippingFee = 0 } = req.body;
+  const { items, shippingFee = 0, shippingAddress } = req.body;
 
   if (!items?.length) {
     throw new ValidationError("Cart is empty");
-  }
-
-  // Ensure authenticated user's phone exists and is valid for MPESA
-  const userPhone = req.user?.phone;
-  if (!userPhone || !/^254[17]\d{8}$/.test(userPhone)) {
-    throw new ValidationError("Authenticated user must have a valid MPESA phone number on their profile (254XXXXXXXXX)");
   }
 
   // Process order items and validate stock
@@ -42,29 +36,35 @@ export const createOrder = asyncHandler(async (req, res) => {
       throw new ValidationError(`Insufficient stock for ${book.title}`);
     }
 
+    const itemSubtotal = book.price * item.qty;
     processedItems.push({
       book: book._id,
       title: book.title,
       price: book.price,
-      qty: item.qty
+      qty: item.qty,
+      subtotal: itemSubtotal
     });
 
-    subtotal += book.price * item.qty;
+    subtotal += itemSubtotal;
   }
 
   const total = subtotal + shippingFee;
 
-  // Snapshot customer details from user profile (useful as a record)
-  const customerSnapshot = {
-    name: req.user.name || "",
-    phone: userPhone,
-    email: req.user.email || ""
-  };
+  // Ensure authenticated user's phone exists and is valid for MPESA
+  const userPhone = req.user?.phone;
+  if (!userPhone || !/^254[17]\d{8}$/.test(userPhone)) {
+    throw new ValidationError("Authenticated user must have a valid MPESA phone number on their profile (254XXXXXXXXX)");
+  }
 
   // Create order tied to authenticated user
   const order = await Order.create({
     user: req.user._id,
-    customer: customerSnapshot,
+    customer: {
+      name: req.user.name || "",
+      phone: userPhone,
+      email: req.user.email || ""
+    },
+    shippingAddress: shippingAddress,
     items: processedItems,
     subtotal,
     shipping: shippingFee,
@@ -79,14 +79,14 @@ export const createOrder = asyncHandler(async (req, res) => {
     const mpesaResponse = await stkPush({
       phone: userPhone,
       amount: Math.round(total),
-      accountRef: order._id.toString(), // keep order id as ref
+      accountRef: order._id.toString(),
       callbackUrl: `${process.env.API_BASE_URL}/api/orders/mpesa/callback`
     });
 
     // Attach MPESA details to order and save
     order.mpesa = {
-      merchantRequestId: mpesaResponse.merchantRequestId,
-      checkoutRequestId: mpesaResponse.checkoutRequestId,
+      merchantRequestId: mpesaResponse.MerchantRequestID,
+      checkoutRequestId: mpesaResponse.CheckoutRequestID,
       response: mpesaResponse
     };
     await order.save();
@@ -95,6 +95,8 @@ export const createOrder = asyncHandler(async (req, res) => {
       success: true,
       data: {
         orderId: order._id,
+        orderNumber: order.orderNumber,
+        total,
         mpesa: mpesaResponse
       }
     });
@@ -108,35 +110,32 @@ export const createOrder = asyncHandler(async (req, res) => {
 });
 
 /**
- * @desc    MPESA payment callback handler (Safaricom -> our backend)
+ * @desc    MPESA payment callback handler with email notification
  * @route   POST /api/orders/mpesa/callback
  * @access  Public
  */
 export const mpesaCallback = asyncHandler(async (req, res) => {
-  // Safaricom posts the callback inside Body.stkCallback (varies by integration)
   const callback = req.body?.Body?.stkCallback || req.body?.stkCallback || req.body;
   if (!callback) {
     return res.status(400).json({ message: "Invalid MPESA callback format" });
   }
 
-  // Extract possible account reference (AccountReference) and CheckoutRequestID
   const accountRef = callback?.CallbackMetadata?.Item
     ?.find(item => item.Name === "AccountReference")?.Value;
 
   const checkoutRequestId = callback?.CheckoutRequestID || callback?.CheckoutRequestId || callback?.checkoutRequestID;
   const resultCode = callback?.ResultCode ?? callback?.resultCode ?? null;
 
-  // Find the corresponding order either by accountRef (if it's order id) OR mpesa.checkoutRequestId
+  // Find the corresponding order
   const order = await Order.findOne({
     $or: [
       accountRef ? { _id: accountRef } : null,
       { "mpesa.checkoutRequestId": checkoutRequestId }
     ].filter(Boolean)
-  });
+  }).populate("user");
 
   if (!order) {
-    console.error("Order not found for MPESA callback", { accountRef, checkoutRequestId, body: req.body });
-    // Respond OK to prevent retries from Safaricom
+    console.error("Order not found for MPESA callback", { accountRef, checkoutRequestId });
     return res.json({ status: "OK" });
   }
 
@@ -154,7 +153,7 @@ export const mpesaCallback = asyncHandler(async (req, res) => {
   order.paymentStatus = success ? "PAID" : "FAILED";
 
   if (success) {
-    // Extract metadata items into key->value map (if present)
+    // Extract metadata
     const metadata = {};
     (callback?.CallbackMetadata?.Item || []).forEach(item => {
       if (item?.Name && item?.Value !== undefined) {
@@ -163,15 +162,24 @@ export const mpesaCallback = asyncHandler(async (req, res) => {
     });
     order.mpesa.metadata = metadata;
 
-    // Decrement stock for each item BUT ensure we only decrement once
-    // (since we checked order.paymentStatus !== "PAID" above, this is safe)
+    // Decrement stock for each item
     await Promise.all(
       order.items.map(item =>
         Book.findByIdAndUpdate(item.book, { $inc: { stock: -item.qty } })
       )
     );
+
+    // Send confirmation email
+    if (order.user) {
+      try {
+        await sendOrderConfirmation(order, order.user);
+        console.log("Order confirmation email sent for order:", order.orderNumber);
+      } catch (emailError) {
+        console.error("Failed to send order confirmation email:", emailError);
+        // Don't throw error - email failure shouldn't fail the payment
+      }
+    }
   } else {
-    // Optionally store failure reasons
     order.mpesa.error = callback?.ResultDesc || callback?.resultDesc || "MPESA payment failed";
   }
 
@@ -218,7 +226,7 @@ export const getOrders = asyncHandler(async (req, res) => {
 export const getOrderById = asyncHandler(async (req, res) => {
   const order = await Order.findById(req.params.id)
     .populate("user", "name email phone")
-    .populate("items.book", "title price");
+    .populate("items.book", "title price image");
 
   if (!order) throw new NotFoundError("Order not found");
 
@@ -245,6 +253,14 @@ export const updateOrderStatus = asyncHandler(async (req, res) => {
   if (!order) throw new NotFoundError("Order not found");
 
   order.status = status;
+  
+  // Update timestamps for shipping/delivery
+  if (status === "SHIPPED" && !order.shippedAt) {
+    order.shippedAt = new Date();
+  } else if (status === "DELIVERED" && !order.deliveredAt) {
+    order.deliveredAt = new Date();
+  }
+  
   await order.save();
 
   res.json({ success: true, data: order });
@@ -256,9 +272,151 @@ export const updateOrderStatus = asyncHandler(async (req, res) => {
  * @access  Private
  */
 export const getMyOrders = asyncHandler(async (req, res) => {
-  const orders = await Order.find({ user: req.user._id })
-    .sort("-createdAt")
-    .populate("items.book", "title price");
+  const { page = 1, limit = 10 } = req.query;
+  
+  const [orders, total] = await Promise.all([
+    Order.find({ user: req.user._id })
+      .sort("-createdAt")
+      .skip((page - 1) * limit)
+      .limit(Number(limit))
+      .populate("items.book", "title price image"),
+    Order.countDocuments({ user: req.user._id })
+  ]);
 
-  res.json({ success: true, count: orders.length, data: orders });
+  res.json({ 
+    success: true, 
+    count: orders.length,
+    pagination: {
+      total,
+      page: Number(page),
+      pages: Math.ceil(total / limit)
+    },
+    data: orders 
+  });
+});
+
+/**
+ * @desc    Retry payment for failed order
+ * @route   POST /api/orders/:id/retry-payment
+ * @access  Private
+ */
+export const retryPayment = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  
+  if (!order) {
+    throw new NotFoundError("Order not found");
+  }
+
+  // Check if user owns the order or is admin
+  if (!req.user.isAdmin && order.user.toString() !== req.user._id.toString()) {
+    throw new ValidationError("Not authorized to retry this payment");
+  }
+
+  if (order.paymentStatus !== "FAILED") {
+    throw new ValidationError("Can only retry failed payments");
+  }
+
+  const userPhone = req.user.phone;
+  if (!userPhone || !/^254[17]\d{8}$/.test(userPhone)) {
+    throw new ValidationError("Valid MPESA phone number required");
+  }
+
+  try {
+    // Initiate MPESA payment again
+    const mpesaResponse = await stkPush({
+      phone: userPhone,
+      amount: Math.round(order.total),
+      accountRef: order._id.toString(),
+      callbackUrl: `${process.env.API_BASE_URL}/api/orders/mpesa/callback`
+    });
+
+    // Update order with new MPESA attempt
+    order.paymentStatus = "PENDING";
+    order.mpesa = {
+      merchantRequestId: mpesaResponse.MerchantRequestID,
+      checkoutRequestId: mpesaResponse.CheckoutRequestID,
+      response: mpesaResponse,
+      retryAttempts: (order.mpesa?.retryAttempts || 0) + 1
+    };
+    await order.save();
+
+    res.json({
+      success: true,
+      data: {
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        mpesa: mpesaResponse
+      }
+    });
+  } catch (error) {
+    throw new PaymentError("Payment retry failed: " + error.message);
+  }
+});
+
+/**
+ * @desc    Cancel order
+ * @route   PUT /api/orders/:id/cancel
+ * @access  Private
+ */
+export const cancelOrder = asyncHandler(async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  
+  if (!order) {
+    throw new NotFoundError("Order not found");
+  }
+
+  // Check if user owns the order or is admin
+  if (!req.user.isAdmin && order.user.toString() !== req.user._id.toString()) {
+    throw new ValidationError("Not authorized to cancel this order");
+  }
+
+  // Only allow cancellation for pending or processing orders
+  if (!["PENDING", "PROCESSING"].includes(order.paymentStatus)) {
+    throw new ValidationError("Cannot cancel order with current status");
+  }
+
+  order.status = "CANCELLED";
+  order.paymentStatus = "FAILED";
+  await order.save();
+
+  res.json({
+    success: true,
+    data: order
+  });
+});
+
+/**
+ * @desc    Get order statistics for admin
+ * @route   GET /api/orders/stats
+ * @access  Private/Admin
+ */
+export const getOrderStats = asyncHandler(async (req, res) => {
+  const stats = await Order.aggregate([
+    {
+      $group: {
+        _id: "$paymentStatus",
+        count: { $sum: 1 },
+        totalRevenue: { $sum: "$total" }
+      }
+    }
+  ]);
+
+  const totalStats = await Order.aggregate([
+    {
+      $group: {
+        _id: null,
+        totalOrders: { $sum: 1 },
+        totalRevenue: { $sum: "$total" },
+        avgOrderValue: { $avg: "$total" }
+      }
+    }
+  ]);
+
+  res.json({
+    success: true,
+    data: {
+      statusStats: stats,
+      overall: totalStats[0] || { totalOrders: 0, totalRevenue: 0, avgOrderValue: 0 }
+    }
+  });
 });
